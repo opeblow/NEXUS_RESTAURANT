@@ -1,0 +1,451 @@
+import os
+import json
+import uuid
+import datetime
+import pandas as pd
+from typing import List, Dict, Any
+from dotenv import load_dotenv
+from dateutil.parser import parse
+from dateutil import tz
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+from langchain.agents import AgentExecutor
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.memory import ConversationBufferMemory
+from langchain.agents import create_openai_tools_agent
+from langchain.agents.format_scratchpad.openai_tools import format_to_openai_tool_messages
+from langchain.agents.output_parsers.openai_tools import OpenAIToolsAgentOutputParser
+
+# Load environment variables from .env file
+load_dotenv()
+
+# configuration
+DB_FILE = "bookings.json"
+CSV_PATH = r"C:\Users\user\Documents\nexus\restaurantmenuchanges.csv"
+FAISS_INDEX_PATH = "faiss_restaurant_index"
+TABLE_CAPACITIES = {
+    "T1": 2, "T2": 4, "T3": 6, "T4": 4, "T5": 8
+}
+
+# Standard FAQs and Policies
+FAQ_AND_POLICIES_TEXT = [
+    "Opening Hours: We are open from 11:00 AM to 10:00 PM, Tuesday to Sunday. We are closed on Mondays.",
+    "Reservation Policy: Reservations can be made up to 30 days in advance. For parties larger than 8, please call us directly.",
+    "Dietary Restrictions: We can accommodate most gluten-free and nut-free requests. All vegan items are clearly marked.",
+    "Parking: Street parking is available, and there is a paid parking garage 2 blocks away.",
+    "Wait Times: Standard wait time for a walk-in during peak hours (6 PM - 8 PM) is 30-45 minutes.",
+    "Wine List: We offer a selection of local and imported red and white wines, detailed on our wine list.",
+]
+
+# Global variables to cache loaded data
+_vector_store_cache = None
+_menu_texts_cache = None
+
+#  Loading and Formating the CSV Dataset 
+def create_data_strings_from_csv(csv_path=CSV_PATH) -> List[str]:
+    global _menu_texts_cache
+    
+    # Return cached data if already loaded
+    if _menu_texts_cache is not None:
+        return _menu_texts_cache
+    
+    print(f" Loading and processing menu data from {csv_path} ")
+    try:
+        df = pd.read_csv(csv_path,on_bad_lines="skip",engine="python")
+        required_columns = ['menuItemName', 'menuItemDescription', 'menuItemCategory', 'menuItemCurrentPrice']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            raise KeyError(f"Missing required columns: {missing_columns}")
+        menu_texts = df.apply(
+            lambda row: f"{row['menuItemName']} - {row['menuItemDescription']} (Category: {row['menuItemCategory']}, Price: {row['menuItemCurrentPrice']})",
+            axis=1
+        ).tolist()
+        print(f"Successfully loaded {len(menu_texts)} menu items from CSV")
+        _menu_texts_cache = menu_texts
+        return menu_texts
+    except FileNotFoundError:
+        print(f"ERROR: CSV file not found at path: {csv_path}")
+        print("Returning placeholder data. Please create 'menu.csv' and run again.")
+        placeholder = ["Placeholder Dish - This is a placeholder description (Category: Placeholder, Price: $0.00)"]
+        _menu_texts_cache = placeholder
+        return placeholder
+    except KeyError as e:
+        print(f"ERROR: {e}")
+        print("Ensure your CSV has 'menuItemName', 'menuItemDescription', 'menuItemCategory', and 'menuItemCurrentPrices' columns.")
+        placeholder = ["Placeholder Dish - Check CSV column names (Category: Error, Price: $0.00)"]
+        _menu_texts_cache = placeholder
+        return placeholder
+
+#  Combine and Chunk Documents 
+def create_or_load_faiss_index(menu_texts: List[str]):
+    global _vector_store_cache
+    
+    # Return cached vector store if already loaded
+    if _vector_store_cache is not None:
+        return _vector_store_cache
+    
+    try:
+        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    except Exception as e:
+        print(f"Error loading HuggingFace model: {e}")
+        raise
+    
+    full_data = FAQ_AND_POLICIES_TEXT + menu_texts
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=20)
+    combined_text = "\n".join(full_data)
+    chunked_texts = text_splitter.split_text(combined_text)
+    chunked_texts = [chunk.strip() for chunk in chunked_texts if chunk.strip()]
+    print(f"Created {len(chunked_texts)} chunks from {len(full_data)} original documents.")
+
+    if os.path.exists(FAISS_INDEX_PATH):
+        print("Loading existing FAISS index")
+        vector_store = FAISS.load_local(
+            folder_path=FAISS_INDEX_PATH, 
+            embeddings=embeddings, 
+            allow_dangerous_deserialization=True
+        )
+        print(f" FAISS index loaded successfully from {FAISS_INDEX_PATH}")
+    else:
+        print("Creating new FAISS index from chunked texts and saving locally")
+        vector_store = FAISS.from_texts(chunked_texts, embeddings)
+        vector_store.save_local(FAISS_INDEX_PATH)
+        print(f"FAISS index created and saved successfully to {FAISS_INDEX_PATH}")
+    
+    _vector_store_cache = vector_store
+    return vector_store
+
+#Definition of FAISS Semantic Search Tool
+@tool
+def faiss_semantic_search(query: str) -> str:
+    """Performs a semantic search on the restaurant's menu and policies using FAISS."""
+    vector_store = create_or_load_faiss_index(create_data_strings_from_csv())
+    results = vector_store.similarity_search(query, k=3)
+    return "\n".join([result.page_content for result in results])
+
+#  Initializing Local JSON Database 
+def initialize_bookings_db():
+    initial_db = {
+        "tables": {table_id: {"capacity": capacity, "status": "available"} for table_id, capacity in TABLE_CAPACITIES.items()},
+        "bookings": [],
+        "orders": []
+    }
+    if not os.path.exists(DB_FILE):
+        with open(DB_FILE, "w") as f:
+            json.dump(initial_db, f, indent=2)
+        print(f"Initialized {DB_FILE} with default structure.")
+    else:
+        print(f" Database {DB_FILE} already exists.")
+
+#  Defining Utility Tools 
+@tool
+def mock_pos_sync(table_id: str, booking_details: dict) -> str:
+    """Simulate updating the Point-Of-Sale(pos)system with a table booking."""
+    return f"POS system updated for Table {table_id} with details: {booking_details}"
+
+@tool
+def send_reminder(booking_details: dict) -> str:
+    """Simulate sending a reminder for a booking."""
+    return f"Reminder sent for booking: {booking_details}"
+
+@tool
+def get_menu_items(query: str = "") -> str:
+    """Retrieves menu items based on a query or returns all menu items if no query is provided."""
+    vector_store = create_or_load_faiss_index(create_data_strings_from_csv())
+    if query:
+        results = vector_store.similarity_search(query, k=5)
+        return "\n".join([result.page_content for result in results])
+    else:
+        menu_texts = create_data_strings_from_csv()
+        return "\n".join(menu_texts[:10])
+
+@tool
+def create_delivery_order(items: List[str], delivery_address: str, delivery_time: str) -> str:
+    """Creates a delivery order with the specified items, address, and time."""
+    try:
+        with open(DB_FILE, "r") as f:
+            db = json.load(f)
+    except FileNotFoundError:
+        initialize_bookings_db()
+        with open(DB_FILE, "r") as f:
+            db = json.load(f)
+    
+    menu_texts = create_data_strings_from_csv()
+    valid_items = []
+    for item in items:
+        if any(item.lower() in menu_text.lower() for menu_text in menu_texts):
+            valid_items.append(item)
+        else:
+            return f"Error: '{item}' is not on the menu. Please check the menu and try again."
+    
+    if not valid_items:
+        return "Error: No valid menu items provided."
+    
+    try:
+        wat_tz = tz.gettz("Africa/Lagos")
+        parsed_time = parse(delivery_time, fuzzy=True, default=datetime.datetime.now(tz=wat_tz))
+        formatted_time = parsed_time.isoformat()
+    except Exception:
+        return "Error: Invalid delivery time format. Please specify a time (e.g., '7 PM today')."
+    
+    order_id = str(uuid.uuid4())
+    order_details = {
+        "order_id": order_id,
+        "items": valid_items,
+        "delivery_address": delivery_address,
+        "delivery_time": formatted_time,
+        "status": "pending"
+    }
+    db["orders"].append(order_details)
+    
+    with open(DB_FILE, "w") as f:
+        json.dump(db, f, indent=2)
+    
+    delivery_result = mock_delivery_system(order_details)
+    return f"Order confirmed! Order ID: {order_id}\nItems: {', '.join(valid_items)}\nDelivery to: {delivery_address} at {formatted_time}\n{delivery_result}"
+
+@tool
+def mock_delivery_system(order_details: dict) -> str:
+    """Simulates sending order details to a delivery service."""
+    return f"Delivery system notified for Order ID: {order_details['order_id']} to {order_details['delivery_address']}"
+
+# Creating Table Availability Tool 
+@tool
+def check_table_availability(party_size: int, time: str) -> str:
+    """Find the most suitable available table for a given party size and time."""
+    try:
+        with open(DB_FILE, "r") as f:
+            db = json.load(f)
+    except FileNotFoundError:
+        initialize_bookings_db()
+        with open(DB_FILE, "r") as f:
+            db = json.load(f)
+    
+    best_table = None
+    min_capacity = float("inf")
+    for table_id, table_info in db["tables"].items():
+        if table_info["status"] == "available" and table_info["capacity"] >= party_size:
+            if table_info["capacity"] < min_capacity:
+                min_capacity = table_info["capacity"]
+                best_table = table_id
+    if best_table:
+        return best_table
+    return "No available tables for the requested party size and time."
+
+#  Mock Google Calendar Tool 
+@tool
+def book_google_calendar_event(booking_details: dict) -> str:
+    """Simulate creating a Google Calendar event for a table booking."""
+    event_id = str(uuid.uuid4())
+    return f"Google Calendar event created with Event ID: {event_id}"
+
+# Creating Local Reservation Tool 
+@tool
+def reserve_table_locally(table_id: str, event_id: str, booking_details: dict) -> str:
+    """Reserve a table in the local JSON database and trigger downstream mocks"""
+    try:
+        with open(DB_FILE, "r") as f:
+            db = json.load(f)
+    except FileNotFoundError:
+        initialize_bookings_db()
+        with open(DB_FILE, "r") as f:
+            db = json.load(f)
+    
+    if table_id in db["tables"]:
+        db["tables"][table_id]["status"] = "occupied"
+    booking_details["table_id"] = table_id
+    booking_details["event_id"] = event_id
+    db["bookings"].append(booking_details)
+    
+    with open(DB_FILE, "w") as f:
+        json.dump(db, f, indent=2)
+    
+    pos_result = mock_pos_sync(table_id, booking_details)
+    reminder_result = send_reminder(booking_details)
+    return f"Reservation confirmed for Table {table_id}. Event ID: {event_id}\n{pos_result}\n{reminder_result}"
+
+#  Initializing LLM and Toolset 
+def initialize_llm_and_tools():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY not found in .env file. Please set it.")
+    
+    llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=api_key)
+    tools = [
+        faiss_semantic_search,
+        get_menu_items,
+        check_table_availability,
+        book_google_calendar_event,
+        reserve_table_locally,
+        create_delivery_order,
+        mock_pos_sync,
+        send_reminder,
+        mock_delivery_system
+    ]
+    return llm, tools
+#  Defining Agent Strategy 
+def create_agent_prompt():
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are NEXUS , a restaurant reservation and menu assistant, now also handling food delivery orders. For menu or policy queries, use get_menu_items or faiss_semantic_search. For booking requests, follow this sequence:
+1. Call check_table_availability to find an available table.
+2. If a table is available, call book_google_calendar_event to create a calendar event.
+3. If the calendar event is created, call reserve_table_locally to finalize the booking, which will trigger mock_pos_sync and send_reminder.
+For food delivery orders, follow this sequence:
+1. Use get_menu_items to confirm requested items are on the menu.
+2. If items are valid, call create_delivery_order with the items, delivery address, and time, which will trigger mock_delivery_system.
+Do not deviate from these sequences. Respond concisely and professionally."""),
+        MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "{input}"),
+        MessagesPlaceholder(variable_name="agent_scratchpad")
+    ])
+    return prompt
+
+#  Initializing data during startup 
+def initialize_data():
+    """Pre-load CSV and FAISS index to show initialization messages."""
+    print("\n" + "="*60)
+    print("INITIALIZING RESTAURANT ASSISTANT")
+    print("="*60)
+    
+    # Initializing database
+    initialize_bookings_db()
+    
+    # Loading CSV data
+    menu_texts = create_data_strings_from_csv()
+    
+    # Load or create FAISS index
+    create_or_load_faiss_index(menu_texts)
+    
+    print("="*60)
+    print("INITIALIZATION COMPLETE")
+    print("="*60 + "\n")
+
+#  Enhanced Terminal Interface with Timezone Handling 
+def main():
+    # Initialize all data first
+    initialize_data()
+    
+    try:
+        llm, tools = initialize_llm_and_tools()
+    except ValueError as e:
+        print(f"Error: {e}")
+        return
+    
+    prompt = create_agent_prompt()
+    agent=(
+        {
+            "input":lambda x:(
+                x["input"]
+                if isinstance(x,dict)
+                else(x[0]["input"] if isinstance(x,list)and len(x)>0 and isinstance(x[0],dict)and "input" in x[0]else None)
+            ),
+            "chat_history":lambda x:(
+                x.get("chat_history",[])
+                if isinstance(x,dict)
+                else[]
+            ),
+            "agent_scratchpad":lambda x: (
+                format_to_openai_tool_messages(
+                    x.get("intermediate_steps",[])
+                    if isinstance(x,dict)
+                    else []
+                )
+                if isinstance(x,(dict,list))
+                else{}
+            ),   
+        }
+        |prompt
+        |llm.bind_tools(tools)
+        |OpenAIToolsAgentOutputParser()
+    )
+    memory = ConversationBufferMemory(
+        memory_key="chat_history",
+        return_messages=True
+    )
+    
+    agent_executor=AgentExecutor(
+        agent=agent,
+        tools=tools,
+        memory=memory,
+        verbose=True
+    )
+    
+    
+    print("\n Welcome to NEXUS Restaurant Assistant! ")
+    print("I can help with menu questions, restaurant policies, booking a table, or ordering food for delivery.")
+    print("Examples:")
+    print("  - Menu: 'What vegan options do you have?'")
+    print("  - Booking: 'Book a table for 4 at 7 PM tomorrow'")
+    print("  - Ordering: 'Order a Margherita Pizza and Caesar Salad for delivery to 123 Main St at 6 PM'")
+    print("  - Policies: 'What are your opening hours?'")
+    print("Type 'exit' or 'quit' to stop.\n")
+
+    wat_tz = tz.gettz("Africa/Lagos")
+
+    while True:
+        user_input = input("How can I assist you? > ").strip()
+        if user_input.lower() in ["exit", "quit"]:
+            print("Thank you for using the Restaurant Assistant. Goodbye!")
+            break
+        if not user_input:
+            print("Please enter a valid request.")
+            continue
+        
+        try:
+            if "order" in user_input.lower() and "delivery" in user_input.lower():
+                words = user_input.lower().split()
+                address_start = words.index("to") if "to" in words else -1
+                time_start = words.index("at") if "at" in words else -1
+                if address_start == -1 or time_start == -1:
+                    print("Please specify items, delivery address (after 'to'), and time (after 'at'). E.g., 'Order a Margherita Pizza for delivery to 123 Main St at 6 PM'.")
+                    continue
+                
+                items = user_input[:user_input.lower().index(" for delivery")].replace("order ", "", 1).split(" and ")
+                items = [item.strip() for item in items]
+                delivery_address = " ".join(words[address_start + 1:time_start])
+                delivery_time = " ".join(words[time_start + 1:])
+                
+                response = agent.invoke({
+                    "input": f"Order {', '.join(items)} for delivery to {delivery_address} at {delivery_time}"
+                })
+            elif "book" in user_input.lower() or "reserve" in user_input.lower():
+                words = user_input.lower().split()
+                party_size = None
+                for i, word in enumerate(words):
+                    if word.isdigit():
+                        party_size = int(word)
+                        break
+                if not party_size:
+                    print("Please specify a party size (e.g., 'Book a table for 4').")
+                    continue
+                try:
+                    time_str = " ".join(words[words.index("at") + 1:]) if "at" in words else ""
+                    parsed_time = parse(time_str, fuzzy=True, default=datetime.datetime.now(tz=wat_tz))
+                    formatted_time = parsed_time.isoformat()
+                    booking_details = {"party_size": party_size, "time": formatted_time}
+                    response = agent.invoke({"input": f"Book a table for {party_size} at {formatted_time}"})
+                except Exception as e:
+                    print(f"Error parsing booking request: {e}. Please specify party size and time (e.g., 'Book a table for 4 at 7 PM').")
+                    continue
+            else:
+                response = agent.invoke({"input": user_input})
+            print("\nResponse:")
+            print(response["output"])
+            print()
+        except Exception as e:
+            print(f"Error processing request: {e}. Please try again.")
+            print()
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+

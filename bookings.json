@@ -1,0 +1,26 @@
+{
+  "tables": {
+    "T1": {
+      "capacity": 2,
+      "status": "available"
+    },
+    "T2": {
+      "capacity": 4,
+      "status": "available"
+    },
+    "T3": {
+      "capacity": 6,
+      "status": "available"
+    },
+    "T4": {
+      "capacity": 8,
+      "status": "available"
+    },
+    "T5": {
+      "capacity": 10,
+      "status": "available"
+    }
+  },
+  "bookings": [],
+  "orders": []
+}
