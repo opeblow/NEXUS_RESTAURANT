@@ -11,20 +11,22 @@ from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langchain.agents import AgentExecutor
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.memory import ConversationBufferMemory
 from langchain.agents import create_openai_tools_agent
 from langchain.agents.format_scratchpad.openai_tools import format_to_openai_tool_messages
 from langchain.agents.output_parsers.openai_tools import OpenAIToolsAgentOutputParser
+import re
+import traceback
 
 # Load environment variables from .env file
 load_dotenv()
 
 # configuration
 DB_FILE = "bookings.json"
-CSV_PATH = r"C:\Users\user\Documents\nexus\restaurantmenuchanges.csv"
+CSV_PATH = "restaurantmenuchanges.csv"
 FAISS_INDEX_PATH = "faiss_restaurant_index"
 TABLE_CAPACITIES = {
     "T1": 2, "T2": 4, "T3": 6, "T4": 4, "T5": 8
@@ -272,7 +274,7 @@ def initialize_llm_and_tools():
     if not api_key:
         raise ValueError("OPENAI_API_KEY not found in .env file. Please set it.")
     
-    llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=api_key)
+    llm = ChatOpenAI(model="gpt-4", temperature=0, api_key=api_key)
     tools = [
         faiss_semantic_search,
         get_menu_items,
@@ -288,7 +290,8 @@ def initialize_llm_and_tools():
 #  Defining Agent Strategy 
 def create_agent_prompt():
     prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are NEXUS , a restaurant reservation and menu assistant, now also handling food delivery orders. For menu or policy queries, use get_menu_items or faiss_semantic_search. For booking requests, follow this sequence:
+        ("system", """You are NEXUS , a restaurant reservation and menu assistant, now also handling food delivery orders. For menu or policy queries, use get_menu_items or faiss_semantic_search.For each menu item,explicitly list the 'menuItemName',its 'menuItemCategory',and its 'menuItemCurrentPrice'.Do not omit or summarize these details.
+          For booking requests, follow this sequence:
 1. Call check_table_availability to find an available table.
 2. If a table is available, call book_google_calendar_event to create a calendar event.
 3. If the calendar event is created, call reserve_table_locally to finalize the booking, which will trigger mock_pos_sync and send_reminder.
@@ -321,6 +324,32 @@ def initialize_data():
     print("="*60)
     print("INITIALIZATION COMPLETE")
     print("="*60 + "\n")
+
+
+def extract_party_size(text:str)->int:
+    """Extract party size from text using regex-handles all format"""
+    all_numbers=re.findall(r'\d+',text)
+    patterns=[
+        (r'(?:table|party|reservation)\s+(?:for|of)\s+(\d+)','table/party context'),
+        (r'(?:for|of)\s+(\d+)\s*(?:people|persons|guests|ppl)?','for/of pattern'),
+        (r'(\d+)\s+(?:people|persons|guests|ppl)','number + people'),
+
+    ]
+    text_lower=text.lower()
+
+    for pattern,description in patterns:
+        match=re.search(pattern,text_lower)
+        if match:
+            return int(match.group(1))
+        
+    if all_numbers:
+        for num_str in all_numbers:
+            num=int(num_str)
+            if 1 <=num <=20 and num not in [11,12]:
+                return num
+        return int(all_numbers[0])
+    return None
+    
 
 #  Enhanced Terminal Interface with Timezone Handling 
 def main():
@@ -407,39 +436,81 @@ def main():
                 delivery_address = " ".join(words[address_start + 1:time_start])
                 delivery_time = " ".join(words[time_start + 1:])
                 
-                response = agent.invoke({
+                response = agent_executor.invoke({
                     "input": f"Order {', '.join(items)} for delivery to {delivery_address} at {delivery_time}"
                 })
             elif "book" in user_input.lower() or "reserve" in user_input.lower():
-                words = user_input.lower().split()
-                party_size = None
-                for i, word in enumerate(words):
-                    if word.isdigit():
-                        party_size = int(word)
-                        break
+                party_size=extract_party_size(user_input)
+
                 if not party_size:
-                    print("Please specify a party size (e.g., 'Book a table for 4').")
+                    print(f"Could not detect party size in :'{user_input}")
+                    print("Please specify a party size (e.g.,'Book a table for 4 at 7 PM').")
                     continue
+                print(f"Detected prty size:{party_size}")
+
                 try:
-                    time_str = " ".join(words[words.index("at") + 1:]) if "at" in words else ""
-                    parsed_time = parse(time_str, fuzzy=True, default=datetime.datetime.now(tz=wat_tz))
-                    formatted_time = parsed_time.isoformat()
-                    booking_details = {"party_size": party_size, "time": formatted_time}
-                    response = agent.invoke({"input": f"Book a table for {party_size} at {formatted_time}"})
+                    time_indicators=['at','tomorrow','today','tonight','pm','am','evening','morning','afternoon','night']
+                    time_str=""
+
+                    if "at" in user_input.lower():
+                        time_str=user_input.lower().split("at",1)[1]
+
+                    else:
+                        words=user_input.split()
+                        capturing=False
+                        time_parts=[]
+                        for word in words:
+                            if any(indicator in word.lower()for indicator in time_indicators):
+                                capturing=True
+
+                            if capturing:
+                                time_parts.append(word)
+
+                        time_str="".join(time_parts)
+
+                    if time_str.strip():
+                        parsed_time=parse(time_str,fuzzy=True,default=datetime.datetime.now(tz=wat_tz))
+                        print(f"Parsed time:{parsed_time.strftime('%I:%M %p on %B %d,%Y')}")
+
+                    else:
+                        parsed_time=datetime.datetime.now(tz=wat_tz)+ datetime.timedelta(hours=1)
+                        print(f"No time specified. Using :{parsed_time.strftime('%I:%M %p')}")
+
+                    formatted_time=parsed_time.isoformat()
+                    response=agent_executor.invoke({
+                        "input":f"Book a table for {party_size} people at {formatted_time}"
+                    })
+
                 except Exception as e:
-                    print(f"Error parsing booking request: {e}. Please specify party size and time (e.g., 'Book a table for 4 at 7 PM').")
-                    continue
+                    print(f"Error parsing time:{e}")
+                    print("Using default time(1 hour from now)....")
+                    parsed_time=datetime.datetime.now(tz=wat_tz) + datetime.timedelta(hours=1)
+                    formatted_time=parsed_time.isoformat()
+
+                    response=agent_executor.invoke({
+                        f"Book a table for {party_size}people at {formatted_time}"
+                    })
             else:
-                response = agent.invoke({"input": user_input})
+                response=agent_executor.invoke({"input":user_input})
             print("\nResponse:")
             print(response["output"])
             print()
         except Exception as e:
-            print(f"Error processing request: {e}. Please try again.")
+            print(f"Error processing request:{e}")
+            traceback.print_exc()
             print()
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
+
+
+          
+
+                
+                        
+
+
+          
 
 
 
