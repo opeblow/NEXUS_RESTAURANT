@@ -11,7 +11,7 @@ from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langchain.agents import AgentExecutor
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.memory import ConversationBufferMemory
@@ -238,35 +238,52 @@ def check_table_availability(party_size: int, time: str) -> str:
 
 #  Mock Google Calendar Tool 
 @tool
-def book_google_calendar_event(booking_details: dict) -> str:
-    """Simulate creating a Google Calendar event for a table booking."""
-    event_id = str(uuid.uuid4())
-    return f"Google Calendar event created with Event ID: {event_id}"
+def book_google_calendar_event(party_size:int,time:str ) -> str:
+    """Simulate creating a Google Calendar event for a table booking.
+    Args:
+      party_size=Number of people in the party
+      time:
+         ISO formatted datetime string for the reservation.
+    """
+    event_id=str(uuid.uuid4())
+    return f"Google Calendar event created with EVENT ID:{event_id} for {party_size} people at {time}"
+  
 
 # Creating Local Reservation Tool 
 @tool
-def reserve_table_locally(table_id: str, event_id: str, booking_details: dict) -> str:
-    """Reserve a table in the local JSON database and trigger downstream mocks"""
+def reserve_table_locally(table_id: str, event_id: str, party_size:str,time:str) -> str:
+    """Reserve a table in the local JSON database and trigger downstream mocks
+    Args:
+      table_id:The ID of the table to reserve
+      evebt_id:The Google calendar event ID
+      party_size:Number of people in the party
+      time:ISO formatted datetime
+    """
     try:
-        with open(DB_FILE, "r") as f:
-            db = json.load(f)
+        with open(DB_FILE,"r")as file:
+            db=json.load(file)
     except FileNotFoundError:
         initialize_bookings_db()
-        with open(DB_FILE, "r") as f:
-            db = json.load(f)
-    
+        with open(DB_FILE,"r")as file:
+            db=json.load(file)
+    booking_details={
+        "party_size":party_size,
+        "time":time,
+        "event_id":event_id,
+        "table_id":table_id
+    }
     if table_id in db["tables"]:
-        db["tables"][table_id]["status"] = "occupied"
-    booking_details["table_id"] = table_id
-    booking_details["event_id"] = event_id
+        db["tables"][table_id]["status"]="occupied"
     db["bookings"].append(booking_details)
-    
-    with open(DB_FILE, "w") as f:
-        json.dump(db, f, indent=2)
-    
-    pos_result = mock_pos_sync(table_id, booking_details)
-    reminder_result = send_reminder(booking_details)
-    return f"Reservation confirmed for Table {table_id}. Event ID: {event_id}\n{pos_result}\n{reminder_result}"
+
+    with open(DB_FILE,"w")as file:
+        json.dump(db,file,indent=2)
+
+    pos_result=mock_pos_sync(table_id,booking_details)
+    reminder_result=send_reminder(booking_details)
+    return f" Reservation Confirmed for Table {table_id}.Event ID:{event_id}\n{pos_result}\n{reminder_result}"
+
+
 
 #  Initializing LLM and Toolset 
 def initialize_llm_and_tools():
@@ -292,9 +309,9 @@ def create_agent_prompt():
     prompt = ChatPromptTemplate.from_messages([
         ("system", """You are NEXUS , a restaurant reservation and menu assistant, now also handling food delivery orders. For menu or policy queries, use get_menu_items or faiss_semantic_search.For each menu item,explicitly list the 'menuItemName',its 'menuItemCategory',and its 'menuItemCurrentPrice'.Do not omit or summarize these details.
           For booking requests, follow this sequence:
-1. Call check_table_availability to find an available table.
-2. If a table is available, call book_google_calendar_event to create a calendar event.
-3. If the calendar event is created, call reserve_table_locally to finalize the booking, which will trigger mock_pos_sync and send_reminder.
+1. Call check_table_availability with party_size to find an available table.
+2. If a table is available, call book_google_calendar_event with party_size and time to create a calendar event.Extract the event_id from the response.
+3. Call reserve_table_locally with table_id,event_id,party_size,and time to finalize the booking,which will trigger mock_pos_sync and send_reminder.
 For food delivery orders, follow this sequence:
 1. Use get_menu_items to confirm requested items are on the menu.
 2. If items are valid, call create_delivery_order with the items, delivery address, and time, which will trigger mock_delivery_system.
@@ -488,7 +505,7 @@ def main():
                     formatted_time=parsed_time.isoformat()
 
                     response=agent_executor.invoke({
-                        f"Book a table for {party_size}people at {formatted_time}"
+                        "input":f"Book a table for {party_size}people at {formatted_time}"
                     })
             else:
                 response=agent_executor.invoke({"input":user_input})
