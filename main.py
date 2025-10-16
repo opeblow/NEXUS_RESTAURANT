@@ -20,6 +20,8 @@ from langchain.agents.format_scratchpad.openai_tools import format_to_openai_too
 from langchain.agents.output_parsers.openai_tools import OpenAIToolsAgentOutputParser
 import re
 import traceback
+import subprocess
+import json as json_lib
 
 # Load environment variables from .env file
 load_dotenv()
@@ -45,7 +47,7 @@ FAQ_AND_POLICIES_TEXT = [
 # Global variables to cache loaded data
 _vector_store_cache = None
 _menu_texts_cache = None
-
+mcp_available=False
 #  Loading and Formating the CSV Dataset 
 def create_data_strings_from_csv(csv_path=CSV_PATH) -> List[str]:
     global _menu_texts_cache
@@ -205,7 +207,7 @@ def create_delivery_order(items: List[str], delivery_address: str, delivery_time
     with open(DB_FILE, "w") as f:
         json.dump(db, f, indent=2)
     
-    delivery_result = mock_delivery_system(order_details)
+    delivery_result = mock_delivery_system.invoke({"order_details":order_details})
     return f"Order confirmed! Order ID: {order_id}\nItems: {', '.join(valid_items)}\nDelivery to: {delivery_address} at {formatted_time}\n{delivery_result}"
 
 @tool
@@ -279,11 +281,71 @@ def reserve_table_locally(table_id: str, event_id: str, party_size:str,time:str)
     with open(DB_FILE,"w")as file:
         json.dump(db,file,indent=2)
 
-    pos_result=mock_pos_sync(table_id,booking_details)
-    reminder_result=send_reminder(booking_details)
+    pos_result=mock_pos_sync.invoke({"table_id":table_id,"booking_details":booking_details})
+    reminder_result=send_reminder.invoke({"booking_details":booking_details})
     return f" Reservation Confirmed for Table {table_id}.Event ID:{event_id}\n{pos_result}\n{reminder_result}"
 
 
+@tool
+def process_payment_via_mcp(amount:float,customer_name:str,customer_email:str)->str:
+    """Process payment through MCP server(stripe-style mock)"""
+    if not mcp_available:
+        return "Pyment system unavailable.Please try again later."
+    try:
+        mcp_input={
+            "amount":amount,
+            "customer_name":customer_name,
+            "customer_email":customer_email,
+            "card_number":"4242424242424242"
+        }
+
+        result=subprocess.run(
+            ['python','c',
+            f'from mcp import mcp;impor json;result=mcp.call_tool("process_payment",{json_lib.dumps(mcp_input)});print(json.dumps(result))' ],
+            text=True,
+            timeout=10
+        )
+
+        if result.returncode==0:
+            response=json_lib.loads(result.stdout)
+            return response.get("message","payment processed")
+        else:
+            return f"Payment failed:{result.stderr}"
+    except Exception as e:
+        return f" Payment failed :{str(e)}"
+    
+@tool
+def assign_delivery_via_mcp(order_id:str,address:str,customer_name:str,phone:str,total:float)->str:
+    """Assign delivery rider through MCP server."""
+    if not mcp_available:
+        return "Delivery system unavailable.Please try again later."
+    try:
+        mcp_input={
+            "order_id":order_id,
+            "delivery_address":address,
+            "customer_name":customer_name,
+            "customer_phone":phone,
+            "order_total":total
+        }
+
+        result=subprocess.run(
+            [ 'python','c',
+              f'from mcp import mcp;import json;result=mcp.call_tool("assign_delivery_rider",{json_lib.dumps(mcp_input)});print(json.dumps(result))'
+
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        if result.returncode==0:
+            response=json_lib.loads(result.stdout)
+            return response.get("message","Rider assigned")
+        else:
+            return f"Rider assignment failed:{result.stderr}"
+        
+    except Exception as e:
+        return f" Rider assignment failed:{str(e)}"
 
 #  Initializing LLM and Toolset 
 def initialize_llm_and_tools():
@@ -301,7 +363,9 @@ def initialize_llm_and_tools():
         create_delivery_order,
         mock_pos_sync,
         send_reminder,
-        mock_delivery_system
+        mock_delivery_system,
+        process_payment_via_mcp,
+        assign_delivery_via_mcp
     ]
     return llm, tools
 #  Defining Agent Strategy 
@@ -312,10 +376,22 @@ def create_agent_prompt():
 1. Call check_table_availability with party_size to find an available table.
 2. If a table is available, call book_google_calendar_event with party_size and time to create a calendar event.Extract the event_id from the response.
 3. Call reserve_table_locally with table_id,event_id,party_size,and time to finalize the booking,which will trigger mock_pos_sync and send_reminder.
-For food delivery orders, follow this sequence:
-1. Use get_menu_items to confirm requested items are on the menu.
-2. If items are valid, call create_delivery_order with the items, delivery address, and time, which will trigger mock_delivery_system.
-Do not deviate from these sequences. Respond concisely and professionally."""),
+For food delivery orders(2 workflows):
+workflow(A)-A simple Delivey(No payments):
+1.use get_menu+items to verify items.
+2.call create_delivery_order with items,address,time(triggers mock_delivery_system)
+
+workflow B-Delivery with payment
+ 1.when user asks about food(e.g,"jollof rice"),use get_menu_items
+  2.show all matching items with prices
+  3.Ask:would you like to order[item]for $? I can process payment and arrange delivery.
+  4.If yes to payment +delivery:
+         a.collect:name,email,address,phone
+         b.call process_payment_via_mcp(amount,name,email)
+         c.if mpayment successful,call assign_delivery_via_mcp(order_id,address,name,phone,total)
+         d.Share rider details and ETA
+         Use workflow A for simple orders.Use workflow B when user wants to pay
+    5.If payments fails,suggest trying again.       """),
         MessagesPlaceholder(variable_name="chat_history"),
         ("human", "{input}"),
         MessagesPlaceholder(variable_name="agent_scratchpad")
